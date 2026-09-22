@@ -11,9 +11,11 @@ name: Load Credit Watchdog
 
 on:
   schedule:
-    # 21:07 UTC, Sunday-Thursday - late enough that even a badly delayed load
-    # has had time to run, early enough to still be the same day in Israel.
-    - cron: "7 21 * * 0,1,2,3,4"
+    # 15:43 UTC, Sunday-Thursday. The load is scheduled for 00:23 UTC and the
+    # worst delay on record is just under 8 hours, so by now it has either
+    # happened or it is not going to. Reporting in the Israeli evening still
+    # leaves time to trigger the workflow by hand before the day is out.
+    - cron: "43 15 * * 0,1,2,3,4"
   workflow_dispatch:
 
 permissions:

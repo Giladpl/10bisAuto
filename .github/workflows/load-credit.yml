@@ -2,16 +2,24 @@ name: Load Credit
 
 on:
   schedule:
-    # 04:17 UTC, Sunday-Thursday.
+    # 00:23 UTC, Sunday-Thursday (03:23 Israel in summer, 02:23 in winter).
     #
-    # Why 04:17 and not the old 07:05: GitHub queues scheduled runs and
-    # deprioritises them when Actions is busy, and "round" minutes near the top
-    # of the hour wait the longest. At 07:05 this job drifted from ~45 minutes
-    # late (August) to a steady 5-7 hours late, so credit was being loaded
-    # around 15:00-17:00 Israel time instead of 10:05. An odd minute in a
-    # quieter hour shortens the queue wait, and starting earlier leaves enough
-    # headroom that even a badly delayed run still lands in the morning.
-    - cron: "17 4 * * 0,1,2,3,4"
+    # GitHub does not run scheduled workflows on time. It queues them and
+    # deprioritises them when Actions is busy. At the old 07:05 UTC this job
+    # ran ~45 minutes late through August 2026, then from 2026-08-27 settled
+    # at a steady 4.5-8 hours late, which put the credit load at 15:00-18:00
+    # Israel time - too late to notice it had happened.
+    #
+    # The delay cannot be removed, so the start time absorbs it. Measured
+    # against the 17 delayed runs (min 271 min, median 327, max 475), 00:23 UTC
+    # lands at roughly 08:00-09:00 Israel time, worst case 11:20 - and at 03:23
+    # if GitHub ever catches up again. Every one of those is the same calendar
+    # day in Israel, which is what keeps the Sunday-Thursday mapping honest.
+    #
+    # The minute is deliberately odd: runs scheduled on the hour wait longest.
+    # The run summary reports the actual queue delay, so retune from real data
+    # rather than guesswork.
+    - cron: "23 0 * * 0,1,2,3,4"
   workflow_dispatch:
     inputs:
       force_weekend:
