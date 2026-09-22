@@ -1,0 +1,94 @@
+name: Load Credit Watchdog
+
+# The Load Credit workflow reports failures itself, but it cannot report a day
+# on which it never ran - a schedule GitHub dropped, a workflow disabled after
+# a period of repository inactivity, or a run still stuck in the queue. This
+# job checks after the fact that a successful load actually happened, and opens
+# an issue (which GitHub emails to the repository owner) when one did not.
+#
+# It only reads and reports. It never loads credit, so it can never cause a
+# double charge.
+
+on:
+  schedule:
+    # 21:07 UTC, Sunday-Thursday - late enough that even a badly delayed load
+    # has had time to run, early enough to still be the same day in Israel.
+    - cron: "7 21 * * 0,1,2,3,4"
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check that credit was loaded in the last 24 hours
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const since = Date.now() - 24 * 60 * 60 * 1000;
+
+            const { data } = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'load-credit.yml',
+              per_page: 20,
+            });
+
+            const recent = data.workflow_runs.filter(
+              (run) => new Date(run.run_started_at).getTime() >= since
+            );
+            const succeeded = recent.find((run) => run.conclusion === 'success');
+            const pending = recent.find(
+              (run) => run.status === 'queued' || run.status === 'in_progress'
+            );
+
+            for (const run of recent) {
+              console.log(`${run.run_started_at}  ${run.status}/${run.conclusion}  ${run.html_url}`);
+            }
+
+            if (succeeded) {
+              core.info(`Credit was loaded successfully: ${succeeded.html_url}`);
+              return;
+            }
+            if (pending) {
+              core.warning(`A Load Credit run is still ${pending.status}: ${pending.html_url}`);
+              return;
+            }
+
+            const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Jerusalem' });
+            const title = `🔴 10bis credit was not loaded — ${today}`;
+            const failed = recent.filter((run) => run.conclusion !== 'success');
+            const body = [
+              `No successful **Load Credit** run in the last 24 hours as of ${today}.`,
+              '',
+              failed.length
+                ? `Runs that did start:\n${failed.map((r) => `- ${r.html_url} (${r.conclusion})`).join('\n')}`
+                : 'The workflow did not start at all. Check that it is still enabled under the Actions tab - GitHub disables scheduled workflows in repositories with no activity for 60 days.',
+              '',
+              `Watchdog run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            ].join('\n');
+
+            const { data: open } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'automation-failure',
+              per_page: 100,
+            });
+
+            if (open.some((issue) => issue.title === title)) {
+              core.warning('An issue for today was already opened.');
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body,
+                labels: ['automation-failure'],
+              });
+            }
+
+            core.setFailed('No successful credit load in the last 24 hours.');

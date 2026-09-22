@@ -2,14 +2,31 @@ name: Load Credit
 
 on:
   schedule:
-    # Credit loading daily at 7:05 AM UTC (10:05 AM Israel time) - avoid conflict with token refresh
-    - cron: "5 7 * * 0,1,2,3,4"
-  workflow_dispatch: # Allow manual triggering
+    # 04:17 UTC, Sunday-Thursday.
+    #
+    # Why 04:17 and not the old 07:05: GitHub queues scheduled runs and
+    # deprioritises them when Actions is busy, and "round" minutes near the top
+    # of the hour wait the longest. At 07:05 this job drifted from ~45 minutes
+    # late (August) to a steady 5-7 hours late, so credit was being loaded
+    # around 15:00-17:00 Israel time instead of 10:05. An odd minute in a
+    # quieter hour shortens the queue wait, and starting earlier leaves enough
+    # headroom that even a badly delayed run still lands in the morning.
+    - cron: "17 4 * * 0,1,2,3,4"
+  workflow_dispatch:
+    inputs:
+      force_weekend:
+        description: "Load credit even if today is Friday/Saturday"
+        type: boolean
+        default: false
 
 # Prevent concurrent runs - only one token operation at a time
 concurrency:
   group: token-operations
   cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
 
 env:
   TZ: Asia/Jerusalem
@@ -25,7 +42,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "18"
+          node-version: "22"
           cache: "npm"
 
       - name: Install dependencies
@@ -42,8 +59,13 @@ jobs:
           }
           EOF
 
+      # A refresh failure must NOT abort the job. Access tokens are valid for
+      # ~3 months, so a transient error here (the 10bis API returned 403 for
+      # every retry on 2026-08-30) leaves the stored token perfectly usable.
+      # Previously that aborted the job and the day's credit was never loaded.
       - name: Refresh tokens before credit loading
         id: refresh
+        continue-on-error: true
         run: node github-refresh-token.js
         env:
           ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
@@ -51,9 +73,17 @@ jobs:
           AMOUNT: ${{ secrets.AMOUNT }}
           MONEYCARD_ID: ${{ secrets.MONEYCARD_ID }}
 
+      - name: Warn if the token refresh did not succeed
+        if: steps.refresh.outcome != 'success'
+        run: |
+          echo "::warning::Token refresh failed - continuing with the existing stored tokens."
+
       - name: Update GitHub secrets with fresh tokens
         if: steps.refresh.outputs.tokens_updated == 'true'
         uses: actions/github-script@v7
+        env:
+          NEW_ACCESS_TOKEN: ${{ steps.refresh.outputs.access_token }}
+          NEW_REFRESH_TOKEN: ${{ steps.refresh.outputs.refresh_token }}
         with:
           github-token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
           script: |
@@ -65,37 +95,28 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
             });
+            const publicKeyBytes = Buffer.from(publicKey.key, 'base64');
 
-            // Encrypt and update ACCESS_TOKEN if provided
-            if ('${{ steps.refresh.outputs.access_token }}') {
-              const accessTokenBytes = Buffer.from('${{ steps.refresh.outputs.access_token }}');
-              const publicKeyBytes = Buffer.from(publicKey.key, 'base64');
-              const accessTokenEncrypted = sodium.crypto_box_seal(accessTokenBytes, publicKeyBytes);
+            // Tokens are read from the environment rather than interpolated into
+            // this script, so a token containing a quote cannot corrupt it.
+            const seal = (value) =>
+              Buffer.from(sodium.crypto_box_seal(Buffer.from(value), publicKeyBytes)).toString('base64');
 
+            const updates = {
+              ACCESS_TOKEN: process.env.NEW_ACCESS_TOKEN,
+              REFRESH_TOKEN: process.env.NEW_REFRESH_TOKEN,
+            };
+
+            for (const [name, value] of Object.entries(updates)) {
+              if (!value) continue;
               await github.rest.actions.createOrUpdateRepoSecret({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                secret_name: 'ACCESS_TOKEN',
-                encrypted_value: Buffer.from(accessTokenEncrypted).toString('base64'),
+                secret_name: name,
+                encrypted_value: seal(value),
                 key_id: publicKey.key_id,
               });
-              console.log('ACCESS_TOKEN updated');
-            }
-
-            // Encrypt and update REFRESH_TOKEN if provided
-            if ('${{ steps.refresh.outputs.refresh_token }}') {
-              const refreshTokenBytes = Buffer.from('${{ steps.refresh.outputs.refresh_token }}');
-              const publicKeyBytes = Buffer.from(publicKey.key, 'base64');
-              const refreshTokenEncrypted = sodium.crypto_box_seal(refreshTokenBytes, publicKeyBytes);
-
-              await github.rest.actions.createOrUpdateRepoSecret({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                secret_name: 'REFRESH_TOKEN',
-                encrypted_value: Buffer.from(refreshTokenEncrypted).toString('base64'),
-                key_id: publicKey.key_id,
-              });
-              console.log('REFRESH_TOKEN updated');
+              console.log(`${name} updated`);
             }
 
             console.log('Secrets updated successfully');
@@ -125,6 +146,57 @@ jobs:
           AMOUNT: ${{ secrets.AMOUNT }}
           MONEYCARD_ID: ${{ secrets.MONEYCARD_ID }}
           TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          # The cron above already restricts scheduled runs to Sunday-Thursday,
+          # so a scheduled run that lands on a Friday is simply a delayed
+          # weekday run and must still load. Without this, a long enough delay
+          # on a Thursday would silently skip the load and still report success.
+          ENFORCE_WEEKEND_SKIP: ${{ (github.event_name == 'schedule' || inputs.force_weekend) && 'false' || 'true' }}
+
+      - name: Verify credit was actually loaded
+        if: always()
+        run: |
+          outcome="${{ steps.load-credit.outputs.credit_loaded }}"
+          case "$outcome" in
+            success)
+              echo "✅ Credit loaded successfully."
+              ;;
+            skipped_weekend)
+              echo "::warning::Credit loading was skipped - today is Friday/Saturday."
+              ;;
+            *)
+              echo "::error::Credit was NOT loaded (outcome: '${outcome:-no outcome reported}')."
+              exit 1
+              ;;
+          esac
+
+      - name: Write run summary
+        if: always()
+        run: |
+          outcome="${{ steps.load-credit.outputs.credit_loaded }}"
+          {
+            echo "### 10bis credit load"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Outcome | \`${outcome:-none}\` |"
+            echo "| Token refresh | \`${{ steps.refresh.outcome }}\` |"
+            echo "| Started (Israel) | $(TZ=Asia/Jerusalem date '+%a %Y-%m-%d %H:%M') |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            cron="${{ github.event.schedule }}"
+            min=$(echo "$cron" | awk '{print $1}')
+            hr=$(echo "$cron" | awk '{print $2}')
+            scheduled=$(date -u -d "$(date -u +%Y-%m-%d) ${hr}:${min}:00" +%s)
+            delay=$(( ($(date -u +%s) - scheduled) / 60 ))
+            # A run delayed past midnight UTC compares against the wrong day.
+            [ "$delay" -lt 0 ] && delay=$(( delay + 1440 ))
+            echo "| Scheduled for | \`$cron\` UTC |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| GitHub queue delay | ${delay} min |" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$delay" -gt 180 ]; then
+              echo "::warning::This run started ${delay} minutes after its scheduled time."
+            fi
+          fi
 
       - name: Upload logs
         if: always()
@@ -133,3 +205,50 @@ jobs:
           name: logs-${{ github.run_number }}
           path: logs/
           retention-days: 30
+
+      # Without this the only sign of a failed day is a red mark in the Actions
+      # tab. Opening an issue makes GitHub email the repository owner, so a
+      # missed load is noticed even when no Teams webhook is configured.
+      - name: Report failure as an issue
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Jerusalem' });
+            const title = `🔴 10bis credit load failed — ${today}`;
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const body = [
+              `The scheduled credit load did not complete on **${today}**.`,
+              '',
+              `- Run: ${runUrl}`,
+              `- Token refresh: \`${{ steps.refresh.outcome }}\``,
+              `- Credit loading: \`${{ steps.load-credit.outputs.credit_loaded || 'no outcome reported' }}\``,
+              '',
+              'Check the run logs. If the tokens have expired, refresh them with `npm run update-github-secrets`.',
+            ].join('\n');
+
+            const { data: open } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'automation-failure',
+              per_page: 100,
+            });
+            const existing = open.find((issue) => issue.title === title);
+
+            if (existing) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.number,
+                body,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body,
+                labels: ['automation-failure'],
+              });
+            }

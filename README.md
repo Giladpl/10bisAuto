@@ -4,8 +4,9 @@ An automated system for managing 10bis credit loading and token refresh operatio
 
 ## Features
 
-- **Automatic Token Refresh**: Refreshes authentication tokens every 10 minutes
-- **Scheduled Credit Loading**: Loads 10bis credit daily at 10 AM (excluding weekends)
+- **Automatic Token Refresh**: Refreshes authentication tokens immediately before every credit load
+- **Scheduled Credit Loading**: Loads 10bis credit every weekday morning (Sunday-Thursday)
+- **Watchdog**: Opens a GitHub issue if a day passes without a successful load
 - **Microsoft Teams Notifications**: Real-time notifications for success/failure with amount and timestamp
 - **Robust Error Handling**: Comprehensive logging and retry mechanisms
 - **Secure Token Management**: Automatic token updates and encrypted storage
@@ -294,9 +295,38 @@ The system interacts with these 10bis API endpoints:
 
 ## Schedule Details
 
-- **Token Refresh**: Every 10 minutes, 24/7
-- **Credit Loading**: Daily at 10:00 AM Israel time, Monday through Thursday and Sunday
-- **Weekend Skip**: Automatically skips Friday and Saturday
+- **Credit Loading**: `.github/workflows/load-credit.yml`, cron `17 4 * * 0,1,2,3,4`
+  (04:17 UTC, Sunday-Thursday). Each run refreshes the tokens first, then loads
+  the credit.
+- **Token Refresh**: `.github/workflows/refresh-token.yml` is manual-only. The
+  standalone schedule is disabled because the credit-loading workflow already
+  refreshes tokens before every load.
+- **Watchdog**: `.github/workflows/watchdog.yml`, cron `7 21 * * 0,1,2,3,4`.
+  Checks that a successful load happened in the previous 24 hours and opens a
+  GitHub issue if not. It only reports - it never loads credit.
+- **Keepalive**: `.github/workflows/keepalive.yml`, monthly. GitHub disables
+  scheduled workflows in a repository with no activity for 60 days.
+- **Weekend Skip**: Friday and Saturday are excluded by the cron expression.
+
+### A note on timing
+
+GitHub does not run scheduled workflows at the requested minute. It queues them
+and deprioritises them when Actions is busy, and runs scheduled near the top of
+the hour wait longest. This job ran roughly 45 minutes late through August 2026,
+then settled into a steady 5-7 hours late, which put the credit load at around
+15:00-17:00 Israel time instead of the morning.
+
+Two things follow from that, and both are deliberate:
+
+- The cron fires at an odd minute (`:17`) in a quiet hour, and early enough that
+  even a multi-hour delay still lands in the morning.
+- A delayed run must not skip itself. The cron already limits scheduled runs to
+  Sunday-Thursday, so the workflow sets `ENFORCE_WEEKEND_SKIP=false` for them: a
+  Thursday run that slips past midnight is a late weekday run and still loads.
+  Manual runs keep the weekend check unless you tick **force_weekend**.
+
+To load credit on a Friday or Saturday on purpose, run the **Load Credit**
+workflow manually from the Actions tab with **force_weekend** enabled.
 
 ## Support
 
