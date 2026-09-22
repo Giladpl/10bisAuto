@@ -129,8 +129,12 @@ class GitHubActionsUtils {
                     throw new Error(`All ${retries} attempts failed. Last error: ${error.message}`);
                 }
                 
-                // Wait before retry (exponential backoff)
-                const waitTime = Math.pow(2, attempt) * 1000;
+                // Wait before retry (exponential backoff with jitter).
+                // The original 2s/4s delays were far too short to clear the
+                // rate limiting behind the 403s the 10bis API returns in
+                // bursts; the jitter avoids retrying on a fixed cadence.
+                const waitTime = Math.min(Math.pow(2, attempt) * 5000, 60000)
+                    + Math.floor(Math.random() * 2000);
                 await this.log(`Waiting ${waitTime}ms before retry...`);
                 await this.sleep(waitTime);
             }

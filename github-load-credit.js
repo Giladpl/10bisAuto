@@ -39,13 +39,23 @@ class GitHubCreditLoader {
             // Initialize Teams webhook notifications
             await this.initializeTeamsWebhook();
             
-            // Check if today is weekend (Friday or Saturday)
+            // Check if today is weekend (Friday or Saturday).
+            //
+            // ENFORCE_WEEKEND_SKIP=false disables this check. The GitHub
+            // Actions cron already restricts scheduled runs to Sunday-Thursday,
+            // and GitHub routinely starts those runs hours late, so a scheduled
+            // run that lands on a Friday is a delayed weekday run whose credit
+            // still needs loading - not a weekend run to skip.
+            const enforceWeekendSkip = process.env.ENFORCE_WEEKEND_SKIP !== 'false';
             if (utils.isWeekend()) {
-                await utils.log('Skipping credit loading - today is weekend (Friday or Saturday)', this.logFile);
-                if (process.env.GITHUB_ACTIONS) {
-                    await utils.setOutput('credit_loaded', 'skipped_weekend');
+                if (enforceWeekendSkip) {
+                    await utils.log('Skipping credit loading - today is weekend (Friday or Saturday)', this.logFile);
+                    if (process.env.GITHUB_ACTIONS) {
+                        await utils.setOutput('credit_loaded', 'skipped_weekend');
+                    }
+                    return;
                 }
-                return;
+                await utils.log('Today is Friday/Saturday but the weekend skip is disabled - treating this as a delayed weekday run and continuing', this.logFile);
             }
             
             // Read current configuration

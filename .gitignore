@@ -120,6 +120,10 @@ ehthumbs.db
 Thumbs.db
 
 # Project specific
+# Local credentials. The workflows generate this file in CI from repository
+# secrets, and the README tells local users to create it by hand - it holds
+# live 10bis access and refresh tokens and must never be committed.
+config.json
 config.json.backup
 *.backup
 
